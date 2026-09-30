@@ -1,0 +1,5 @@
+===== Second Stage Result =====
+makespan list : [4579.279999999999]
+mean makespan list : 4579.28
+std makespan list : 0.00
+Evaluation Time list (sec): [59835.47284436226]

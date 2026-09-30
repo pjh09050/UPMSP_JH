@@ -1,0 +1,39 @@
+# config.yml
+hyperparameter:
+  gamma : 0.95
+  learning_rate : 0.001
+  batch_size : 64
+  buffer_limit : 750000
+  input_layer : 51
+  output_layer : 1
+  episode : 2000
+  initial_setup : True
+  job_arrival_end_type : max_job    # max_job, end_time
+  end_time : 100
+  max_job : 1 # 각 job type 마다 최대 몇 개를 생성할 것 인지 설정
+  family_type : 5 # family 갯수 설정
+  family_setup : sequence_dependent_family_setup # family_setup : 20, sequence_dependent_family_setup
+  maintenance_time : 170 # 유지보수 시간 설정
+  maintenance_threshold : 0.5 # family LDR 일때 유지보수 임계값 설정
+  T : 0.1
+  R : 0.25
+  object : makespan # makespan, total_tardiness # 원하는 목적함수 설정
+
+configRL:
+  state_type : MC_DQN_state  # MC_DQN_state, two_stage_rnn, js_state
+  maintenance : True # 유지보수를 할거면 True, 아니면 False
+  donothing : False # donothing을 추가할거면 True, 아니면 False
+  action_type : two_stage_dqn_rule   # two_stage_dqn_rule, dsp_rule, two_stage_rnn, ppo_job_select, Family_LDR, two_stage_dqn, dsp_rule, job_select, mc_job_select
+  reward_type : setup_pm_d_time      # setup_pm_d_time, two_stage_rnn, setup, deterioration_makespan, deterioration_tardiness
+
+engine:
+  gantt_on_check : True  # 간트생성 및 저장 on/off
+  save_plot : True # 결과그래프 저장 on/off
+  param_down_on : True  # 모델 저장 on/off
+  log_on : True  # console print 기록 on/off
+
+#  meta_ver : False     # metaheuristic 버전 on/off
+#  log_history : False  # lot 이력 db로 전송 여부
+#  do_nothing_time : 60       # donothing time
+#  plan_horizon : 100000000    # 계획 구동 기간
+#  use_rule : SPT

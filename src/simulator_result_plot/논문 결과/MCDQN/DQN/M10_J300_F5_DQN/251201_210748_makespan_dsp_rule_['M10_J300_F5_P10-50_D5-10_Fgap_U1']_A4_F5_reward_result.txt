@@ -1,0 +1,7 @@
+makespan : 1668.734 
+누적 reward : -8987.384000000002 
+pm time : -2100 
+setup time : -746 
+deterioration time : -6141.384000000006 
+previous p time : -7296.0 
+p time : -13437.383999999996 
