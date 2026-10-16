@@ -31,9 +31,3 @@ engine:
   save_plot : True # 결과그래프 저장 on/off
   param_down_on : True  # 모델 저장 on/off
   log_on : True  # console print 기록 on/off
-
-#  meta_ver : False     # metaheuristic 버전 on/off
-#  log_history : False  # lot 이력 db로 전송 여부
-#  do_nothing_time : 60       # donothing time
-#  plan_horizon : 100000000    # 계획 구동 기간
-#  use_rule : SPT
