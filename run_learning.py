@@ -5,7 +5,6 @@ from src.learner.Algorithm.MC_job_select import *
 from src.learner.Algorithm.MC_rule_select import *
 from src.learner.Algorithm.Two_Stage_DQN import *
 from src.learner.Algorithm.Two_Stage_MC_DQN import *
-from src.learner.Algorithm.Two_Stage_MC_DQN_2 import *
 from src.learner.Algorithm.PMS_PPO_batch import *
 from src.learner.Algorithm.Two_stage_RNN_td import *
 from src.learner.Algorithm.Two_stage_RNN_mc import *
@@ -68,9 +67,6 @@ class Run_Simulator:
                 elif Hyperparameters.action_type == 'dsp_rule':
                     DQN_Rule_Select.get_evaluate(f"{pathConfig.model_save_path}{os.sep}{folder_name}", 4000, 4000,
                                                  [dataset])
-            elif algorithm == "Two_Stage_MC_DQN":
-                Two_Stage_MC_DQN_2.get_evaluate(f"{pathConfig.model_save_path}{os.sep}{folder_name}_agent1",
-                                              f"{pathConfig.model_save_path}{os.sep}{folder_name}_agent2", [dataset])
             elif algorithm == 'MC':
                 if Hyperparameters.action_type == "mc_job_select" or Hyperparameters.action_type == "family_type":
                     MC_Job_Select.get_evaluate(f"{pathConfig.model_save_path}{os.sep}{folder_name}", 2000, 1500,
@@ -96,7 +92,7 @@ class Run_Simulator:
                                              f"{pathConfig.model_save_path}{os.sep}{folder_name}_agent2", [dataset])
             elif algorithm == "Two_Stage_MC_DQN":
                 if Hyperparameters.action_type == 'two_stage_dqn' or Hyperparameters.action_type == 'two_stage_dqn_rule':
-                    Two_Stage_MC_DQN_2.get_result(f"{pathConfig.model_save_path}{os.sep}{folder_name}_agent1",
+                    Two_Stage_MC_DQN.get_result(f"{pathConfig.model_save_path}{os.sep}{folder_name}_agent1",
                                                 f"{pathConfig.model_save_path}{os.sep}{folder_name}_agent2", [dataset],
                                                 param)
             elif algorithm == 'MC':
@@ -114,12 +110,12 @@ class Run_Simulator:
         elif mode == "fix_agent1":
             if algorithm == 'Two_Stage_MC_DQN':
                 if Hyperparameters.action_type == 'two_stage_dqn' or Hyperparameters.action_type == 'two_stage_dqn_rule':
-                    makespan = Two_Stage_MC_DQN_2.fix_agent1_main(
+                    makespan = Two_Stage_MC_DQN.fix_agent1_main(
                         f"{pathConfig.model_save_path}{os.sep}{folder_name}_agent1")
         elif mode == "train_agent1":
             if algorithm == 'Two_Stage_MC_DQN':
                 if Hyperparameters.action_type == 'two_stage_dqn' or Hyperparameters.action_type == 'two_stage_dqn_rule':
-                    save_directory = Two_Stage_MC_DQN_2.only_train_agent1()
+                    save_directory = Two_Stage_MC_DQN.only_train_agent1()
                     return save_directory
         elif mode == "inference":
             if algorithm == "Two_Stage_MC_DQN":
@@ -147,12 +143,12 @@ class Run_Simulator:
         return makespan
 
 if True:
-    # dataset = "M10_J200_F3_P10-50_D5-10_Fgap_U1" # instance 1
-    dataset = "M10_J500_F5_P10-50_D8-13_Fgap_U3" # instance 12
+    dataset = "M25_J1000_F3_P10-50_D5-10_Fgap_U1" # instance 1
+    # dataset = "M10_J500_F5_P10-50_D8-13_Fgap_U3" # instance 12
     # dataset = "M25_J500_F5_P10-50_D5-10_Fgap_U1" # instance 13
     # dataset = "M10_J500_F7_P10-50_D8-13_Fgap_U3" # instance 20
     
-    mode = "inference"
+    mode = "learning"
     Algorithm = "Two_Stage_MC_DQN"
     folder_name = "260917_111804_['M10_J500_F5_P10-50_D5-10_Fgap_U1']"  # 뒤에 에이전트 지우고 작성
     param = None  # two-step-mc-dqn은 굳이 설정 안해도 best 파라미터 탐색해서 결과 보여줌

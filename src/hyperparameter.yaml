@@ -3,7 +3,7 @@ hyperparameter:
   gamma : 0.95
   learning_rate : 0.001
   batch_size : 64
-  buffer_limit : 750000
+  buffer_limit : 1500000
   input_layer : 51
   output_layer : 1
   episode : 2000
@@ -11,9 +11,9 @@ hyperparameter:
   job_arrival_end_type : max_job    # max_job, end_time
   end_time : 100
   max_job : 1 # 각 job type 마다 최대 몇 개를 생성할 것 인지 설정
-  family_type : 5 # family 갯수 설정
+  family_type : 3 # family 갯수 설정
   family_setup : sequence_dependent_family_setup # family_setup : 20, sequence_dependent_family_setup
-  maintenance_time : 170 # 유지보수 시간 설정
+  maintenance_time : 100 # 유지보수 시간 설정
   maintenance_threshold : 0.5 # family LDR 일때 유지보수 임계값 설정
   T : 0.1
   R : 0.25
