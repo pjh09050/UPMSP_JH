@@ -26,6 +26,8 @@ class DataInventory:
                "Factory_db":Factory_db}
     @classmethod
     def set_db_data(cls, data_id):
+        if cls.master_data and cls.dataset_id == data_id:
+            return  # 같은 데이터셋은 이미 로드됨 (reset마다 pickle 재로드 방지)
         cls.dataset_id = data_id
         file_path = f'{pathConfig.pickle_data_path}{os.sep}{cls.dataset_id}_db_data.pkl'
         start_time = time.time()  # ⏱ 시작 시간 기록

@@ -9,8 +9,10 @@ from src.learner.common.Hyperparameters import *
 
 class GanttChart:
     gantt_on = Parameters.gantt_on
-    gantt_history = pd.DataFrame([], columns=['Type', 'JOB_ID', 'Task', 'Start', 'Finish', 'Resource', 'Rule', 'Step',
-                                              'Q_diff', 'Q_check', 'p_time', 'family_type', 'job_arrival_time', 'due_date', 'job'])
+    HISTORY_COLUMNS = ['Type', 'JOB_ID', 'Task', 'Start', 'Finish', 'Resource', 'Rule', 'Step',
+                       'Q_diff', 'Q_check', 'p_time', 'family_type', 'job_arrival_time', 'due_date', 'job']
+    gantt_history = pd.DataFrame([], columns=HISTORY_COLUMNS)
+    history_rows = []  # save_histories가 쌓는 행 (그릴 때 build_history에서 한 번에 DataFrame으로 변환)
     step = 0
     color_by_color_mapper = {'j01': 'rgb(255, 204, 204)', 'j02': 'rgb(229, 204, 255)',
                              'j03': 'rgb(255, 255, 204)', 'j04': 'rgb(204, 229, 255)',
@@ -18,13 +20,13 @@ class GanttChart:
     dataset_id = ""
     @classmethod
     def reset(cls):
-        cls.gantt_history = pd.DataFrame([], columns=['Type', 'JOB_ID', 'Task', 'Start', 'Finish', 'Resource', 'Rule', 'Step',
-                                                      'Q_diff', 'Q_check', 'p_time', 'family_type', 'job_arrival_time', 'due_date', 'job'])
+        cls.gantt_history = pd.DataFrame([], columns=cls.HISTORY_COLUMNS)
+        cls.history_rows = []
         cls.step = 0
-        
+
     @classmethod
     def save_histories(cls, event_type, job_id, jop, start, end, machine_id, rule, step, q_time_diff, q_time_check, p_time, family_type, job_arrival_time, due_date, job):
-        cls.gantt_history.loc[cls.step] = dict(
+        cls.history_rows.append(dict(
             Type=event_type,
             JOB_ID=job_id,
             Task=jop,
@@ -40,8 +42,15 @@ class GanttChart:
             job_arrival_time=job_arrival_time,
             due_date=due_date,
             job=job
-        )  # 간트차트를 위한 딕셔너리 생성, 데이터프레임에 집어넣음
+        ))  # 간트차트를 위한 딕셔너리 생성 (DataFrame 변환은 build_history에서)
         cls.step += 1
+
+    @classmethod
+    def build_history(cls):
+        """쌓아 둔 행으로 gantt_history DataFrame 생성 (행마다 .loc로 추가하면 O(n^2)이라 그릴 때 한 번에 만듦)"""
+        if cls.history_rows:
+            cls.gantt_history = pd.DataFrame(cls.history_rows, columns=cls.HISTORY_COLUMNS)
+            cls.history_rows = []
 
     @classmethod
     def update_df(cls):
@@ -63,6 +72,7 @@ class GanttChart:
 
     @classmethod
     def play_gantt(cls, datasetId, fitness, score, phase):
+        cls.build_history()
         cls.update_df()
         cls.dataset_id = datasetId
         for i in cls.gantt_on:
@@ -210,7 +220,6 @@ class GanttChart:
             )
 
         fig6 = go.Figure()
-        time.sleep(0.1)
         tardiness = False
         if Hyperparameters.object == 'makespan':
             tardiness = False
@@ -258,27 +267,30 @@ class GanttChart:
                             layer="above",
                             line=dict(color="black", width=4)  # 파란색 테두리와 굵기 설정
                         )
+        # (Resource, Color_ID) -> 처음 나오는 행의 위치 (막대마다 전체 행을 다시 검색하지 않도록 한 번에 만듦)
+        first_row_pos = {}
+        for pos, key in enumerate(zip(cls.gantt_history['Resource'], cls.gantt_history['Color_ID'])):
+            first_row_pos.setdefault(key, pos)
         for i, trace in enumerate(fig6.data):
-            time.sleep(0.1)
             resource = trace.y[0]  # Resource 값은 y 배열의 첫 번째 값에 있음
             task_type = trace.name  # 현재 trace의 Type
-            matching_row = cls.gantt_history[(cls.gantt_history['Resource'] == resource) & (cls.gantt_history['Color_ID'] == task_type)]
-            if 'setup' in matching_row.iloc[0]['Type']:
-                trace.customdata = [[matching_row.iloc[0]['Type'], matching_row.iloc[0]['p_time']]]
+            matching_row = cls.gantt_history.iloc[first_row_pos[(resource, task_type)]]  # 조건에 맞는 첫 행
+            if 'setup' in matching_row['Type']:
+                trace.customdata = [[matching_row['Type'], matching_row['p_time']]]
                 trace.texttemplate = "%{customdata[0]}"
                 trace.hovertemplate = None
-            elif "Maintenance" in matching_row.iloc[0]['Type']:
+            elif "Maintenance" in matching_row['Type']:
                 if Hyperparameters.action_type == 'dsp_rule' or Hyperparameters.action_type == 'dsp_rule_per_machine':
-                    trace.customdata = [[matching_row.iloc[0]['Type'], matching_row.iloc[0]['Rule'], matching_row.iloc[0]['p_time']]]
+                    trace.customdata = [[matching_row['Type'], matching_row['Rule'], matching_row['p_time']]]
                     trace.texttemplate = "PM"
                     trace.hovertemplate = None
                 else:
-                    trace.customdata = [[matching_row.iloc[0]['Type'], matching_row.iloc[0]['p_time']]]
+                    trace.customdata = [[matching_row['Type'], matching_row['p_time']]]
                     trace.texttemplate = "PM"
                     trace.hovertemplate = None
-            elif 'NOTHING' in matching_row.iloc[0]['Type']:
-                trace.customdata = [[matching_row.iloc[0]['Type'], matching_row.iloc[0]['Resource'],
-                                     matching_row.iloc[0]['p_time'], matching_row.iloc[0]['Start'], matching_row.iloc[0]['Finish']]]
+            elif 'NOTHING' in matching_row['Type']:
+                trace.customdata = [[matching_row['Type'], matching_row['Resource'],
+                                     matching_row['p_time'], matching_row['Start'], matching_row['Finish']]]
                 trace.texttemplate = (
                     "%{customdata[0]}<br>"
                     "P: %{customdata[2]:.3f}"
@@ -295,12 +307,12 @@ class GanttChart:
             else:
                 if (Hyperparameters.action_type == 'dsp_rule' or Hyperparameters.action_type == 'dsp_rule_per_machine'
                         or Hyperparameters.action_type == "two_stage_dqn_rule"):
-                    trace.customdata = [[matching_row.iloc[0]['Type'], matching_row.iloc[0]['job'].deterioration_rate,
-                                         matching_row.iloc[0]['family_type'], matching_row.iloc[0]['Resource'],
-                                         matching_row.iloc[0]['job'].machine_quality,
-                                         matching_row.iloc[0]['job'].previous_p_time,
-                                         matching_row.iloc[0]['p_time'], matching_row.iloc[0]['Start'],
-                                         matching_row.iloc[0]['Finish'], matching_row.iloc[0]['Rule']]]
+                    trace.customdata = [[matching_row['Type'], matching_row['job'].deterioration_rate,
+                                         matching_row['family_type'], matching_row['Resource'],
+                                         matching_row['job'].machine_quality,
+                                         matching_row['job'].previous_p_time,
+                                         matching_row['p_time'], matching_row['Start'],
+                                         matching_row['Finish'], matching_row['Rule']]]
                     trace.texttemplate = (
                         "%{customdata[9]}"
                     )
@@ -319,11 +331,11 @@ class GanttChart:
                         "</span>"
                     )
                 else:
-                    trace.customdata = [[matching_row.iloc[0]['Type'], matching_row.iloc[0]['job'].deterioration_rate,
-                                         matching_row.iloc[0]['family_type'], matching_row.iloc[0]['Resource'],
-                                         matching_row.iloc[0]['job'].machine_quality, matching_row.iloc[0]['job'].previous_p_time,
-                                         matching_row.iloc[0]['p_time'], matching_row.iloc[0]['Start'], matching_row.iloc[0]['Finish'],
-                                         matching_row.iloc[0]['job_arrival_time'], matching_row.iloc[0]['due_date']]]
+                    trace.customdata = [[matching_row['Type'], matching_row['job'].deterioration_rate,
+                                         matching_row['family_type'], matching_row['Resource'],
+                                         matching_row['job'].machine_quality, matching_row['job'].previous_p_time,
+                                         matching_row['p_time'], matching_row['Start'], matching_row['Finish'],
+                                         matching_row['job_arrival_time'], matching_row['due_date']]]
                     trace.texttemplate = (
                         "%{customdata[0]}"
                     )
@@ -344,10 +356,12 @@ class GanttChart:
             trace.textposition = "inside"
             trace.insidetextanchor = "middle"
 
-        for a, bar in enumerate(fig6.data):
+        seen_groups = set()  # 이미 범례에 나온 그룹 (앞 막대 전체를 다시 훑지 않도록)
+        for bar in fig6.data:
             group_name = bar.name.split('_')[0]
             bar.legendgroup = group_name
-            if a == 0 or all(b.legendgroup != group_name for b in fig6.data[:a]):
+            if group_name not in seen_groups:
+                seen_groups.add(group_name)
                 bar.name = group_name  # 첫 번째 항목만 그룹 이름으로 표시
                 bar.showlegend = True
             else:

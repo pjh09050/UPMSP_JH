@@ -41,6 +41,18 @@ class Simulator:
     demand_by_planhorizon = {}
     oper_in_list = {}
     rule_ratio_dict = Counter()
+    candidate_by_family = {}  # 최근 get_candidate 결과를 family_type별로 묶은 것 (Maintenance 제외)
+    record_history = True  # False면 Gantt 이력 기록 생략 (Gantt를 그리지 않는 학습/평가 에피소드용)
+    wait_lots = {}  # status가 WAIT인 lot만 모은 것 (lot_list 순서 유지, 매 step 전체 lot 순회 방지)
+    lot_order = []  # refresh_wait_lots 시점의 lot 순서 (StateManager의 numpy 집계 기준)
+    lot_index = {}  # lot_id -> lot_order 인덱스
+    wait_mask = np.zeros(0, dtype=bool)  # lot_order 순서의 WAIT 여부
+    lot_order_version = 0  # lot_order가 다시 만들어질 때마다 증가 (StateManager 캐시 무효화용)
+    wait_candidates = {}  # WAIT lot의 후보 [lot, processing_time, setup_time, operation] (lot_list 순서, get_candidate에서 재사용)
+    wait_candidates_by_family = {}  # family_type -> {lot_id: 후보} (lot_list 순서)
+    max_wait_arrival = float('-inf')  # WAIT lot 도착 시간의 최댓값 (runtime 이하면 모든 WAIT lot이 도착한 상태)
+    oper_info_key = None  # 마지막으로 Processing_time_table을 만든 (dataset, machine 구성) - 같으면 reset에서 재계산 생략
+    lot_time_cache = None  # (key, job별 operation별 machine 처리시간, 전체 처리시간 리스트) - get_lot에서 재사용
     rule_ratio_heatmap = {}
     actions_per_bin = []
     pm_times = []
@@ -128,9 +140,9 @@ class Simulator:
                         round(random.uniform(MP * (1 - T - R / 2), MP * (1 - T + R / 2)), 3))
             cls.get_mac_status_info(cls.dataSetId)
             cls.lot_list = {}
+            cls.refresh_wait_lots()
             cls.event_list = []
             cls.machine_list = {}
-            cls.family_set = {}
             cls.initial_setup_setting()
             print(f"[{cls.dataSetId}], Initial Setup List: {cls.initial_setup_job_list}")
             # cls.predefined_arrival_times = []
@@ -164,7 +176,6 @@ class Simulator:
         DataInventory.set_db_data(cls.dataSetId)
         cls.get_job_info(cls.dataSetId)
         cls.get_machine(cls.dataSetId)
-        cls.family_set = {}
 
         cls.remain_job = [Hyperparameters.max_job] * Simulator.number_of_job
         cls.rule_ratio_dict = Counter()
@@ -178,6 +189,7 @@ class Simulator:
         if Parameters.gantt_on:
             GanttChart.reset()
         cls.initial_setup_setting()
+        StateManager.reset_cache()
         machineId = cls.select_machine()
         candidate_list = cls.get_candidate(machineId, None)
         s = StateManager.get_state(cls.lot_list, cls.machine_list, cls.runtime, cls.number_of_job, cls.oper_in_list,
@@ -360,6 +372,7 @@ class Simulator:
                     continue
                 elif event.event_type == 'job_arrival':
                     event.job.arrival()
+                    cls.refresh_wait_lots()
                     cls.make_job_arrival_event(event.job)
                     continue
             else:
@@ -379,7 +392,7 @@ class Simulator:
                 arrival_time = 0
                 due_date = 0
 
-            if Parameters.gantt_on or Parameters.log_hitory:
+            if cls.record_history and (Parameters.gantt_on or Parameters.log_hitory):
                 if Hyperparameters.donothing == False and event.event_type == "NOTHING":
                     pass
                 else:
@@ -593,6 +606,27 @@ class Simulator:
         return {} if tot == 0 else {k: v / tot for k, v in cls.rule_ratio_dict.items()}
 
     @classmethod
+    def record_rule_usage(cls, rule_name):
+        """Agent2가 고른 rule을 전체 비율(rule_ratio_dict)과 100 시간 단위 bin별 히트맵(rule_ratio_heatmap)에 집계
+        (rule_name "1_SPTSDR" -> rule "SPTSDR")"""
+        m = re.match(r"(\d+)_([A-Za-z]+)", rule_name)
+        rule = m.group(2) if m else rule_name
+        cls.rule_ratio_dict[rule] += 1
+        timestep = 100
+        rt = max(1, int(cls.runtime))  # runtime=0 방어
+        bin_idx = (rt - 1) // timestep  # 1~100 -> 0, 101~200 -> 1 ...
+        cls._ensure_bin_capacity(bin_idx)  # 필요 시 배열 확장
+        # 새 rule이면 현재 길이에 맞춰 0으로 채움
+        if rule not in cls.rule_ratio_heatmap:
+            cls.rule_ratio_heatmap[rule] = [0] * len(cls.actions_per_bin)
+        # (안전) 혹시 rule 배열 길이가 더 짧으면 최신 길이에 맞춰 패딩
+        elif len(cls.rule_ratio_heatmap[rule]) < len(cls.actions_per_bin):
+            cls.rule_ratio_heatmap[rule].extend(
+                [0] * (len(cls.actions_per_bin) - len(cls.rule_ratio_heatmap[rule])))
+        cls.rule_ratio_heatmap[rule][bin_idx] += 1
+        cls.actions_per_bin[bin_idx] += 1
+
+    @classmethod
     def _ensure_bin_capacity(cls, idx):
         """idx bin이 필요하면 actions_per_bin과 모든 rule 배열을 그 길이까지 0으로 확장"""
         if idx >= len(cls.actions_per_bin):
@@ -675,23 +709,7 @@ class Simulator:
         if rule_name == "PM":
             cls.pm_times.append(int(cls.runtime))
         if phase == "second" and rule_name != "PM":
-            m = re.match(r"(\d+)_([A-Za-z]+)", rule_name)
-            rule = m.group(2) if m else rule_name
-            cls.rule_ratio_dict[rule] += 1
-            # ====== [추가] 100-step 동적 bin 집계 ======
-            timestep = 100
-            rt = max(1, int(cls.runtime))  # runtime=0 방어
-            bin_idx = (rt - 1) // timestep  # 1~100 -> 0, 101~200 -> 1 ...
-            cls._ensure_bin_capacity(bin_idx)  # 필요 시 배열 확장
-            # 새 rule이면 현재 길이에 맞춰 0으로 채움
-            if rule not in cls.rule_ratio_heatmap:
-                cls.rule_ratio_heatmap[rule] = [0] * len(cls.actions_per_bin)
-            # (안전) 혹시 rule 배열 길이가 더 짧으면 최신 길이에 맞춰 패딩
-            elif len(cls.rule_ratio_heatmap[rule]) < len(cls.actions_per_bin):
-                cls.rule_ratio_heatmap[rule].extend(
-                    [0] * (len(cls.actions_per_bin) - len(cls.rule_ratio_heatmap[rule])))
-            cls.rule_ratio_heatmap[rule][bin_idx] += 1
-            cls.actions_per_bin[bin_idx] += 1
+            cls.record_rule_usage(rule_name)
         if candidate is None or candidate[0] == "Maintenance":
             candidate = None if candidate is None else candidate[:]
         else:
@@ -700,7 +718,8 @@ class Simulator:
         while cls.select_machine() == "NONE":
             cls.process_event()
         if Hyperparameters.donothing == False:
-            if cls.get_candidate(machineId, None) == []:
+            # 남은 후보가 없으면 마지막 작업 -> 남은 이벤트 모두 처리
+            if not cls.has_candidate(machineId):
                 finish_job = True
                 while len(cls.event_list) != 0:
                     cls.process_event()
@@ -959,7 +978,34 @@ class Simulator:
     def assign_setting(cls, job, machine, reservation_time):  # job = 1 machine = 1
         q_time_diff = job.assign_setting(machine, reservation_time)
         machine.assign_setting(job, reservation_time)
+        cls.wait_lots.pop(job.id, None)  # WAIT -> PROCESSING
+        cls.wait_candidates.pop(job.id, None)
+        cls.wait_candidates_by_family.get(job.family_type, {}).pop(job.id, None)
+        idx = cls.lot_index.get(job.id)
+        if idx is not None:
+            cls.wait_mask[idx] = False
         return q_time_diff
+
+    @classmethod
+    def refresh_wait_lots(cls):
+        """lot_list에서 WAIT lot을 다시 모음 (lot 생성/도착처럼 드물게 바뀔 때만 호출)"""
+        cls.wait_lots = {lot_id: lot for lot_id, lot in cls.lot_list.items() if lot.status == "WAIT"}
+        cls.lot_order = list(cls.lot_list.values())
+        cls.lot_index = {lot_id: i for i, lot_id in enumerate(cls.lot_list)}
+        cls.wait_mask = np.array([lot.status == "WAIT" for lot in cls.lot_order], dtype=bool)
+        cls.lot_order_version += 1
+
+        # WAIT lot의 후보를 미리 생성 (후보에 machine별 처리시간 dict 전체가 들어가는 설정이면 get_candidate에서 그대로 사용)
+        cls.wait_candidates = {}
+        cls.wait_candidates_by_family = {}
+        for lot_id, lot in cls.wait_lots.items():
+            for operation, machine_times in lot.processing_times.items():
+                if machine_times is not None:
+                    candidate = [lot, machine_times, 0, operation]
+                    cls.wait_candidates[lot_id] = candidate
+                    cls.wait_candidates_by_family.setdefault(lot.family_type, {})[lot_id] = candidate
+                    break
+        cls.max_wait_arrival = max((lot.job_arrival_time for lot in cls.wait_lots.values()), default=float('-inf'))
 
     @classmethod
     def select_machine(cls):
@@ -972,18 +1018,29 @@ class Simulator:
 
     @classmethod
     def get_candidate(cls, machineId, phase):
-        candidate_list = []
-        for lot in cls.lot_list.values():
-            setup_time = 0
-            if lot.status == "WAIT" and lot.job_arrival_time <= cls.runtime:
-                for operation, machine_times in lot.processing_times.items():
-                    if Hyperparameters.family_setup == "family_setup":
-                        processing_time = machine_times.get(machineId)
-                    else:
-                        processing_time = machine_times
-                    if processing_time is not None:
-                        candidate_list.append([lot, processing_time, setup_time, operation])
-                        break
+        if Hyperparameters.family_setup != "family_setup" and cls.max_wait_arrival <= cls.runtime:
+            # 모든 WAIT lot이 도착했고 후보에 machine별 처리시간 dict 전체가 들어가는 설정
+            # (machine별 값은 사용할 때 candidate[1][machineId]로 꺼냄) -> 미리 만든 후보를 복사만 함
+            # (후보는 사용 전에 항상 candidate[:]로 복사되므로 공유해도 안전)
+            candidate_list = list(cls.wait_candidates.values())
+            cls.candidate_by_family = {family: list(candidates.values())
+                                       for family, candidates in cls.wait_candidates_by_family.items() if candidates}
+        else:
+            candidate_list = []
+            cls.candidate_by_family = {}
+            for lot in cls.wait_lots.values():
+                setup_time = 0
+                if lot.job_arrival_time <= cls.runtime:
+                    for operation, machine_times in lot.processing_times.items():
+                        if Hyperparameters.family_setup == "family_setup":
+                            processing_time = machine_times.get(machineId)
+                        else:
+                            processing_time = machine_times
+                        if processing_time is not None:
+                            candidate = [lot, processing_time, setup_time, operation]
+                            candidate_list.append(candidate)
+                            cls.candidate_by_family.setdefault(lot.family_type, []).append(candidate)
+                            break
         # 유지보수 candidate 넣기
         if Hyperparameters.action_type == "dsp_rule":
             if phase == True:
@@ -995,11 +1052,25 @@ class Simulator:
                     candidate_list.append(['Maintenance', Hyperparameters.maintenance_time, 0, 'Maintenance'])
         else:
             if Hyperparameters.maintenance == True and phase != "second":
-                if all(cls.lot_list[lot].status != "WAIT" for lot in cls.lot_list):
-                    pass
-                else:
+                if cls.wait_lots:
                     candidate_list.append(['Maintenance', Hyperparameters.maintenance_time, 0, 'Maintenance'])
         return candidate_list
+
+    @classmethod
+    def has_candidate(cls, machineId):
+        """get_candidate(machineId, None) != [] 와 같은 판정 (리스트를 만들지 않고 찾으면 바로 반환)"""
+        has_wait = bool(cls.wait_lots)
+        for lot in cls.wait_lots.values():
+            if lot.job_arrival_time <= cls.runtime:
+                for machine_times in lot.processing_times.values():
+                    if Hyperparameters.family_setup == "family_setup":
+                        processing_time = machine_times.get(machineId)
+                    else:
+                        processing_time = machine_times
+                    if processing_time is not None:
+                        return True
+        # job 후보가 없어도 WAIT lot이 있으면 Maintenance 후보가 들어감 (dsp_rule은 job 후보가 있을 때만)
+        return Hyperparameters.action_type != "dsp_rule" and Hyperparameters.maintenance == True and has_wait
 
     @classmethod
     def rule_get_candidate(cls, machineId):
@@ -1046,19 +1117,24 @@ class Simulator:
     def get_lot(cls, dataSetId):
         jobs = DataInventory.get_demand_db_data()
         cls.lot_list = {}
-        cls.family_set = {}
 
-        job_processing_times = {}
-        all_processing_times = []
-        for i, job in enumerate(jobs):
-            job_processing_times[job.jobId] = {}
-            oper_list = cls.job_info[job.jobId]["oper_list"]
-            for oper in oper_list:
-                job_processing_times[job.jobId][oper] = {}
-                for machineId in cls.machine_list:
-                    processing_time = cls.Processing_time_table.get(oper, {}).get(machineId, 0)
-                    job_processing_times[job.jobId][oper][machineId] = processing_time
-                    all_processing_times.append(processing_time)
+        # job별 operation별 machine 처리시간 (같은 dataset/machine 구성이면 매 reset 결과가 같으므로 재사용)
+        cache_key = (dataSetId, cls.oper_info_key)
+        if cls.lot_time_cache is not None and cls.lot_time_cache[0] == cache_key:
+            _, job_processing_times, all_processing_times = cls.lot_time_cache
+        else:
+            job_processing_times = {}
+            all_processing_times = []
+            for i, job in enumerate(jobs):
+                job_processing_times[job.jobId] = {}
+                oper_list = cls.job_info[job.jobId]["oper_list"]
+                for oper in oper_list:
+                    job_processing_times[job.jobId][oper] = {}
+                    for machineId in cls.machine_list:
+                        processing_time = cls.Processing_time_table.get(oper, {}).get(machineId, 0)
+                        job_processing_times[job.jobId][oper][machineId] = processing_time
+                        all_processing_times.append(processing_time)
+            cls.lot_time_cache = (cache_key, job_processing_times, all_processing_times)
 
         cls.p_mean = sum(all_processing_times) / len(all_processing_times)
         cls.all_processing_times = all_processing_times
@@ -1069,10 +1145,6 @@ class Simulator:
         family_type_allocation = []
         for i in range(len(jobs)):
             family_type_allocation.append(family_types[i % family_num])
-
-        # family_set key 미리 생성
-        for family_type in family_types:
-            cls.family_set[family_type] = {}
 
         # job 생성
         a, d = 0, 0
@@ -1090,16 +1162,15 @@ class Simulator:
                 j = Lot(lot_id, job.jobId, cls.job_info[job.jobId]["job_type"], cls.job_info[job.jobId]["max_oper"],
                         job.duedate, 0, status, oper_list, q_time_table, done_machine='None', family_type=family_type)
                 for oper in oper_list:
-                    j.processing_times[oper] = {machineId: job_processing_times[job.jobId][oper][machineId] for machineId in cls.machine_list}
+                    j.processing_times[oper] = dict(job_processing_times[job.jobId][oper])  # lot마다 새 dict (machine_list 순서)
                 if cls.predefined_due_dates:
                     j.duedate = cls.predefined_due_dates[a]
                     a += 1
                 cls.lot_list[lot_id] = j
-                # family_set에도 같이 저장
-                cls.family_set[family_type][lot_id] = j
 
                 cls.remain_job[int(j.job_type[1:]) - 1] -= 1
             d += 1
+        cls.refresh_wait_lots()
 
     @classmethod
     def get_mac_status_info(cls, dataSetId):
@@ -1139,6 +1210,10 @@ class Simulator:
 
     @classmethod
     def get_oper_info(cls, dataSetId):
+        # 같은 dataset/machine 구성으로 이미 만든 테이블이면 결과가 같으므로 다시 만들지 않음 (reset마다 호출됨)
+        cache_key = (dataSetId, tuple((machineId, machine.machine_type) for machineId, machine in cls.machine_list.items()))
+        if cls.oper_info_key == cache_key:
+            return
         opers = DataInventory.get_oper_db_data()
         for oper in opers:
             cls.Q_time_table[oper.operId] = oper.operQtime
@@ -1151,6 +1226,7 @@ class Simulator:
                 if oper.operId not in cls.Processing_time_table:
                     cls.Processing_time_table[oper.operId] = {}
                 cls.Processing_time_table[oper.operId][machineId] = processing_time
+        cls.oper_info_key = cache_key
 
     @classmethod
     def get_setup_time_table(cls, dataSetId, machine):
@@ -1316,6 +1392,7 @@ class Simulator:
                 elif event.event_type == 'job_arrival':
                     # print(f'event 진행: {event.event_type}, job도착: {event.job.job_id}')
                     event.job.arrival()
+                    cls.refresh_wait_lots()
                     cls.make_job_arrival_event(event.job)
                     continue
             else:

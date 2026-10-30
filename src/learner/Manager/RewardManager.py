@@ -6,27 +6,18 @@ import math
 class RewardManager:
     @classmethod
     def get_setup_pm_d_time(cls, machine, j_list, r_list, curr_time, candidate, candidate_list, finish_job, phase):
+        # phase("first"/"second")와 무관하게 같은 보상: PM은 연속 PM 횟수만큼 PM 시간, job은 열화로 늘어난 시간 + setup 시간
         r = 0
         if candidate == None:
             return 0, r_list
-        if phase == "first":
-            if candidate[0] == "Maintenance":
-                pm_time = Hyperparameters.maintenance_time
-                pm_count = r_list[machine].continuous_maintenance_count
-                r -= pm_time * pm_count
-            else:
-                deterioration_time = candidate[1] - candidate[0].previous_p_time
-                setup_time = candidate[2]
-                r -= deterioration_time + setup_time
+        if candidate[0] == "Maintenance":
+            pm_time = Hyperparameters.maintenance_time
+            pm_count = r_list[machine].continuous_maintenance_count
+            r -= pm_time * pm_count
         else:
-            if candidate[0] == "Maintenance":
-                pm_time = Hyperparameters.maintenance_time
-                pm_count = r_list[machine].continuous_maintenance_count
-                r -= pm_time * pm_count
-            else:
-                deterioration_time = candidate[1] - candidate[0].previous_p_time
-                setup_time = candidate[2]
-                r -= deterioration_time + setup_time
+            deterioration_time = candidate[1] - candidate[0].previous_p_time
+            setup_time = candidate[2]
+            r -= deterioration_time + setup_time
         return r, r_list
 
     @classmethod

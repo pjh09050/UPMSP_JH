@@ -15,6 +15,20 @@ class ActionManager:
     action_count = ""
     action_dimension = []
     sim = None
+    rule_family_cache = (None, [])  # (action_dimension, action 번호별 family 번호) - "1_SPTSDR" -> 1, 형식이 다르면 None
+
+    @classmethod
+    def valid_rule_action_indices(cls, missing_family_types):
+        """"{family}_{rule}" 형식 action 중 family의 후보가 있는(missing이 아닌) action 번호 목록
+        (action별 family 번호는 action_dimension이 바뀔 때만 정규식으로 다시 계산)"""
+        key, families = cls.rule_family_cache
+        if key != Hyperparameters.action_dimension:
+            families = []
+            for rule in Hyperparameters.action_dimension:
+                match = re.match(r"(\d+)_([A-Za-z]+)", rule)
+                families.append(int(match.group(1)) if match else None)
+            cls.rule_family_cache = (list(Hyperparameters.action_dimension), families)
+        return [idx for idx, family in enumerate(families) if family is not None and family not in missing_family_types]
 
     @classmethod
     def get_lot(cls, candidate_list, action, current_time, machineId, machine_list, eps, type):
@@ -24,13 +38,7 @@ class ActionManager:
             filtered_candidates = [c for c in candidate_list if c[0] != "Maintenance"]
             candidate_to_family_type = sorted(set(candidate[0].family_type for candidate in filtered_candidates))
             missing_family_types = set(family_list) - set(candidate_to_family_type)
-            valid_action_indices = []
-            for idx, rule in enumerate(Hyperparameters.action_dimension):
-                match = re.match(r"(\d+)_([A-Za-z]+)", rule)
-                if match:
-                    family_type = int(match.group(1))
-                    if family_type not in missing_family_types:
-                        valid_action_indices.append(idx)
+            valid_action_indices = cls.valid_rule_action_indices(missing_family_types)
             sim = cls.get_simulator_instance()
             if sum(machine_list[i].pm_count for i in machine_list) >= np.sqrt(sim.number_of_machine) * np.sqrt(sim.number_of_job):
                 pass
@@ -65,39 +73,26 @@ class ActionManager:
     @classmethod
     def two_stage_dqn(cls, machine_list, machineId, candidate_list, action, eps, type):
         sim = cls.get_simulator_instance()
-        a = sim.family_set
+        candidate_by_family = sim.candidate_by_family
         if type == "first":
             if action == 0:
                 pm_candidates = next((candidate for candidate in candidate_list if candidate[0] == "Maintenance"), None)
                 return pm_candidates, action, 'PM'
             elif action == 1:
                 current_machine_family = machine_list[machineId].family_type
-                valid_action_list = []
-                invalid_action_list = []
-                for candidate in candidate_list:
-                    if candidate[0] == "Maintenance":
-                        continue
-                    if candidate[0].family_type == current_machine_family:
-                        valid_action_list.append(candidate)
-                    else:
-                        invalid_action_list.append(candidate)
+                valid_action_list = candidate_by_family.get(current_machine_family)
                 if valid_action_list:
                     best_candidate = random.choice(valid_action_list)
                 else:
-                    best_candidate = random.choice(invalid_action_list)
+                    # 같은 family가 없으면 Maintenance 제외 전체가 후보 (기존 invalid_action_list와 동일 순서)
+                    best_candidate = random.choice([c for c in candidate_list if c[0] != "Maintenance"])
                 return best_candidate, action - 1, str(best_candidate[0].family_type)
         elif type == "second":
             if Hyperparameters.action_type == "two_stage_dqn_rule":
                 family_list = list(range(1, Hyperparameters.family_type + 1))
-                candidate_to_family_type = sorted(set(candidate[0].family_type for candidate in candidate_list))
+                candidate_to_family_type = sorted(candidate_by_family)
                 missing_family_types = set(family_list) - set(candidate_to_family_type)
-                valid_action_indices = []
-                for idx, rule in enumerate(Hyperparameters.action_dimension):
-                    match = re.match(r"(\d+)_([A-Za-z]+)", rule)
-                    if match:
-                        family_type = int(match.group(1))
-                        if family_type not in missing_family_types:
-                            valid_action_indices.append(idx)
+                valid_action_indices = cls.valid_rule_action_indices(missing_family_types)
 
                 coin = random.random()
                 if coin < eps:
@@ -107,7 +102,7 @@ class ActionManager:
                     best_valid_idx = q_values_valid.argmax().item()
                     action_idx = valid_action_indices[best_valid_idx]
                 rule_name = Hyperparameters.action_dimension[action_idx]
-                candidate = Dispatcher.dispatching_rule_decision(candidate_list, rule_name, machineId, machine_list)
+                candidate = Dispatcher.dispatching_rule_decision(candidate_list, rule_name, machineId, machine_list, candidate_by_family)
                 return candidate, action_idx, str(rule_name)
             else:
                 valid_action_list = action

@@ -8,6 +8,14 @@ import re
 class StateManager:
     sim = None
     state_time = 0
+    max_time_cache = None  # (lot 개수, max_time) - 에피소드 내에서 lot 구성이 같으면 재사용
+    rounded_d_rate = {}  # (dataset, machine_id) -> 소수 3자리로 반올림한 deterioration_rate 배열 (데이터셋이 같으면 재사용)
+    lot_arrays = None  # Simulator.lot_order 순서의 lot별 정적 정보 (family, job 번호, machine별 처리시간)
+
+    @classmethod
+    def reset_cache(cls):
+        cls.max_time_cache = None
+        cls.lot_arrays = None
 
     @classmethod
     def get_state(cls, j_list, r_list, cur_runtime, number_of_job, oper_in_list, candidate_list, candidate, machine_id, previous_machine_id):
@@ -27,40 +35,31 @@ class StateManager:
 
         family_type = Hyperparameters.family_type
 
-        all_p_time, remain_p_time, done_p_time = cls.all_processing_time(sim, j_list, r_list)
-        machine_sums = {machine: np.sum(times) for machine, times in all_p_time.items()}
-        max_machine = max(machine_sums, key=machine_sums.get)
-        max_time = machine_sums[max_machine]
+        max_time = cls.get_max_time(sim, j_list, r_list)
         mean_processing_time = max_time / len(j_list)
 
-        number_of_jobs_wait = 0
-        wait_family_states = [0] * family_type
-        wait_family_p_time = [0] * family_type
-        wait_family_d_rate = [0] * family_type
-        wait_family_counts = [0] * family_type  # 평균 계산용 개수 저장
-        for i, job_id in enumerate(j_list):  # j_list에서 job_id로 job 접근
-            job = j_list[job_id]  # 각 job의 정보 접근
-            job_number = int(job.job_id[1:]) - 1
-            if job.status == "WAIT":
-                number_of_jobs_wait += 1
-                f_type = job.family_type - 1
-                if 0 <= f_type < family_type:
-                    wait_family_states[f_type] += 1
-                    wait_family_p_time[f_type] += job.processing_times[job.current_operation_id][machine_id]# 누적 처리시간
-                    wait_family_d_rate[f_type] += np.round(r_list[machine_id].deterioration_rate[job_number], decimals=3)  # 누적 열화율
-                    wait_family_counts[f_type] += 1
+        # WAIT lot의 family별 개수 / 처리시간 합 / 열화율 합
+        # (bincount는 입력 순서대로 더하므로 lot 순서대로 더하던 기존 반복문과 결과가 같음)
+        lots = cls.get_lot_arrays(sim, r_list)
+        d_rate = cls.get_rounded_d_rate(sim, r_list, machine_id)
+        wait = np.flatnonzero(sim.wait_mask)
+        f_type = lots['family'][wait]
+        in_range = (f_type >= 0) & (f_type < family_type)
+        wait, f_type = wait[in_range], f_type[in_range]
+        wait_family_counts = np.bincount(f_type, minlength=family_type)  # 평균 계산용 개수 저장
+        wait_family_states = wait_family_counts
+        wait_family_p_time = np.bincount(f_type, weights=lots['p_time'][wait, lots['machine_col'][machine_id]], minlength=family_type)  # 누적 처리시간
+        wait_family_d_rate = np.bincount(f_type, weights=d_rate[lots['job_number'][wait]], minlength=family_type)  # 누적 열화율
 
-        s.extend([np.round(w / (len(j_list)/family_type), decimals=3) for w in wait_family_states])
-        avg_wait_p_time = [
-            np.round((wait_family_p_time[i] / wait_family_counts[i]) / mean_processing_time, 3) if wait_family_counts[i] > 0 else 0.0
-            for i in range(family_type)
-        ]
-        avg_wait_d_rate = [
-            np.round((wait_family_d_rate[i] / wait_family_counts[i]) / mean_processing_time, 3) if wait_family_counts[i] > 0 else 0.0
-            for i in range(family_type)
-        ]
-        s.extend(avg_wait_p_time)
-        s.extend(avg_wait_d_rate)
+        # family별 [대기 비율 | 평균 처리시간 | 평균 열화율]을 한 배열로 만들어 한 번에 반올림
+        # (배열 np.round = 원소별 np.round, 대기 lot이 없는 family의 평균은 0.0)
+        has_wait = wait_family_counts > 0
+        family_features = np.concatenate([
+            wait_family_states / (len(j_list) / family_type),
+            np.divide(wait_family_p_time, wait_family_counts, out=np.zeros(family_type), where=has_wait) / mean_processing_time,
+            np.divide(wait_family_d_rate, wait_family_counts, out=np.zeros(family_type), where=has_wait) / mean_processing_time,
+        ])
+        s.extend(np.round(family_features, decimals=3))
 
         # 현재 machine에 대한 정보
         machine_families = r_list[machine_id].family_type
@@ -71,12 +70,15 @@ class StateManager:
         one_hot = [1 if j + 1 in machine_families else 0 for j in range(family_type)]
         s.extend(one_hot)
 
-        machine_maintenance_count = np.round(r_list[machine_id].maintenance_count / (len(j_list)/len(r_list)), decimals=3)
-        machine_pm_term = np.round(r_list[machine_id].pm_term / Hyperparameters.maintenance_time, decimals=3)
+        machine = r_list[machine_id]
+        machine_maintenance_count, machine_pm_term, machine_deterioration_time, machine_setup_count = np.round(np.array([
+            machine.maintenance_count / (len(j_list)/len(r_list)),
+            machine.pm_term / Hyperparameters.maintenance_time,
+            machine.deterioration_time / mean_processing_time,
+            machine.setup_count / len(j_list),
+        ]), decimals=3)  # 서로 독립인 machine 특징은 한 번에 반올림
         # machine_maintenance_time = np.round((machine_maintenance_count * Hyperparameters.maintenance_time) / (max_time / len(j_list)), decimals=3)
-        machine_quality = r_list[machine_id].machine_quality
-        machine_deterioration_time = np.round(r_list[machine_id].deterioration_time / mean_processing_time, decimals=3)
-        machine_setup_count = np.round(r_list[machine_id].setup_count / len(j_list), decimals=3)
+        machine_quality = machine.machine_quality
         setup_time = 0 if candidate is None else candidate[2]
         machine_setup_time = np.round((machine_setup_count * setup_time) / mean_processing_time, decimals=3)
         # machine_cumsum_d_time = np.round((r_list[machine_id].machine_cumsum_d_time) / (max_time/len(j_list)), decimals=3)
@@ -157,9 +159,7 @@ class StateManager:
         #     s.append(sim.total_pm_time_reward)
         #     s.append(sim.total_setup_time_reward + sim.total_d_time_reward + sim.total_pm_time_reward)
 
-        df = pd.Series(s)
-        s = df.to_numpy()
-        return s
+        return np.array(s, dtype=np.float64)
 
     @classmethod
     def two_stage_rnn_state(cls, j_list, r_list, curr_time, candidate_list, machine_id):
@@ -208,7 +208,7 @@ class StateManager:
         number_of_job_done = 0  # clear
 
         sim = cls.get_simulator_instance()
-        all_p_time, remain_p_time, done_p_time = cls.all_processing_time(sim, j_list, r_list)
+        all_p_time = cls.all_processing_time(sim, j_list, r_list)
         machine_sums = {machine: np.sum(times) for machine, times in all_p_time.items()}
         max_machine = max(machine_sums, key=machine_sums.get)
         max_time = machine_sums[max_machine]
@@ -304,27 +304,54 @@ class StateManager:
         return s
 
     @classmethod
+    def get_max_time(cls, sim, j_list, r_list):
+        """machine별 전체 lot processing time 합의 최댓값. lot 구성이 바뀔 때만 다시 계산"""
+        if cls.max_time_cache is None or cls.max_time_cache[0] != len(j_list):
+            all_p_time = cls.all_processing_time(sim, j_list, r_list)
+            machine_sums = {machine: np.sum(times) for machine, times in all_p_time.items()}
+            max_machine = max(machine_sums, key=machine_sums.get)
+            cls.max_time_cache = (len(j_list), machine_sums[max_machine])
+        return cls.max_time_cache[1]
+
+    @classmethod
+    def get_lot_arrays(cls, sim, r_list):
+        """Simulator.lot_order 순서의 lot별 정적 정보를 numpy 배열로 (lot 구성이 바뀔 때만 다시 만듦)
+        - family: family_type - 1,  job_number: job_id 숫자 - 1
+        - p_time[i, c]: lot i의 현재 operation 처리시간 (machine_col[machine_id] = c)
+        """
+        if cls.lot_arrays is None or cls.lot_arrays['version'] != sim.lot_order_version:
+            machine_col = {machine_id: c for c, machine_id in enumerate(r_list)}
+            p_time = np.zeros((len(sim.lot_order), len(machine_col)))
+            for i, lot in enumerate(sim.lot_order):
+                times = lot.processing_times.get(lot.current_operation_id)  # 이미 끝난 lot은 없을 수 있음 (WAIT가 아니므로 사용 안 됨)
+                if times is not None:
+                    p_time[i] = [times[machine_id] for machine_id in machine_col]
+            cls.lot_arrays = {
+                'version': sim.lot_order_version,
+                'family': np.array([lot.family_type - 1 for lot in sim.lot_order], dtype=np.int64),
+                'job_number': np.array([int(lot.job_id[1:]) - 1 for lot in sim.lot_order], dtype=np.int64),
+                'p_time': p_time,
+                'machine_col': machine_col,
+            }
+        return cls.lot_arrays
+
+    @classmethod
+    def get_rounded_d_rate(cls, sim, r_list, machine_id):
+        """machine의 job별 열화율을 소수 3자리로 반올림한 배열 (배열 단위 np.round = 원소별 np.round 와 같은 값)"""
+        key = (sim.dataSetId, machine_id)
+        d_rate = cls.rounded_d_rate.get(key)
+        if d_rate is None:
+            d_rate = np.round(np.asarray(r_list[machine_id].deterioration_rate, dtype=np.float64), decimals=3)
+            cls.rounded_d_rate[key] = d_rate
+        return d_rate
+
+    @classmethod
     def all_processing_time(cls, sim, j_list, r_list):
+        """machine별로 모든 lot의 첫 operation 처리시간 리스트 {machine_id: [lot 순서의 처리시간]}"""
         all_p_time = {}
-        remain_p_time = {}
-        done_p_time = {}
         for machineId in r_list.keys():
-            r_p_time = []
-            a_p_time = []
-            d_p_time = []
-            for lotId in j_list:
-                jobOperId = j_list[lotId].oper_list[0]
-                # processing_time = sim.Processing_time_table[jobOperId][machineId]
-                processing_time = j_list[lotId].processing_times[jobOperId][machineId]
-                a_p_time.append(processing_time)
-                if j_list[lotId].status == "WAIT":
-                    r_p_time.append(processing_time)
-                if machineId == j_list[lotId].done_machine and j_list[lotId].status == "DONE":
-                    d_p_time.append(processing_time)
-            all_p_time[machineId] = a_p_time
-            remain_p_time[machineId] = r_p_time
-            done_p_time[machineId] = d_p_time
-        return all_p_time, remain_p_time, done_p_time
+            all_p_time[machineId] = [j_list[lotId].processing_times[j_list[lotId].oper_list[0]][machineId] for lotId in j_list]
+        return all_p_time
 
     @classmethod
     def get_simulator_instance(cls):

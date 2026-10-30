@@ -38,18 +38,18 @@ class Qnet(nn.Module):
         return self.model(x)
 
     def sample_action_list(self, obs):
-        obs = obs.to(device)
-        return self.forward(obs)
+        # 행동 선택용 Q값 (학습에 쓰이지 않으므로 gradient 계산 생략)
+        with torch.no_grad():
+            return self.forward(obs)
 
     def sample_action(self, obs, epsilon, pm_end):
-        obs = obs.to(device)
-        out = self.forward(obs)
+        # forward는 greedy 선택일 때만 필요 (난수 사용 순서는 기존과 동일)
         if pm_end == True:
             return 1
-        else:
-            if random.random() < epsilon:
-                return random.randint(0, self.output_layer - 1)
-            return out.argmax().item()
+        if random.random() < epsilon:
+            return random.randint(0, self.output_layer - 1)
+        with torch.no_grad():
+            return self.forward(obs).argmax().item()
 
     def select_action(self, obs):
         obs = obs.to(device)
@@ -217,21 +217,63 @@ class Two_Stage_MC_DQN:
         print(f"📄 Best result TXT 저장 완료: {txt_path}")
         return makespan
 
+    @staticmethod
+    def pm_limit():
+        """에피소드당 PM 상한 (넘으면 Agent1은 PM을 고르지 않음)"""
+        return np.sqrt(Simulator.number_of_machine) * np.sqrt(Simulator.number_of_job)
+
+    @staticmethod
+    def recent_mean(values, n_epi, window=50):
+        """values에서 n_epi까지 최근 window개의 nan 제외 평균 (모두 nan이면 nan)"""
+        recent = values[max(0, n_epi - window + 1):n_epi + 1]
+        return np.nanmean(recent) if np.any(~np.isnan(recent)) else np.nan
+
+    @classmethod
+    def run_two_stage_episode(cls, data_id, q_pm, q_job, epsilon=0, pm_count=0, on_step=None):
+        """Agent1(PM 여부, 항상 greedy) -> Agent2(rule 선택) 순서로 에피소드 하나를 끝까지 실행
+        - epsilon: two_step_select에 넘기는 탐색률
+        - pm_count: 시작 PM 횟수 (여러 dataset에 걸쳐 누적할 때 사용)
+        - on_step(s, a_pm, a_job, r, s_prime, done): 매 step 후 호출 (PM step이면 a_job은 None)
+        반환: (score, pm_count, pm_end)
+        """
+        s = cls.env.reset(data_id)
+        pm_limit = cls.pm_limit()
+        done, score, pm_end = False, 0.0, False
+        while not done:
+            s_tensor = torch.from_numpy(s).float().to(device)
+            if pm_count >= pm_limit:
+                pm_end = True
+            a_pm = q_pm.sample_action(s_tensor, 0, pm_end)
+            if a_pm == 0:
+                pm_count += 1
+                s_prime, r, done, _, _ = cls.env.two_step_select(a_pm, epsilon, 'first')
+                a_job = None
+            else:
+                a_list = q_job.sample_action_list(s_tensor)
+                s_prime, r, done, a_job, _ = cls.env.two_step_select(a_list, epsilon, 'second')
+            if on_step is not None:
+                on_step(s, a_pm, a_job, r, s_prime, done)
+            s = s_prime
+            score += r
+        return score, pm_count, pm_end
+
     @classmethod
     def train_agent1(cls, save_directory):
         score = 0.0
         pm_count = 0
         for n_epi in range(Hyperparameters.episode):
             epsilon = max(0, 1 - n_epi / (Hyperparameters.episode - 1))
+            Simulator.record_history = (n_epi == Hyperparameters.episode - 1)  # Gantt는 마지막 에피소드만 그림
             for dataid in Parameters.datasetId:
                 s = cls.env.reset(dataid)
+                pm_limit = cls.pm_limit()
                 done = False
                 score = 0.0
                 pm_count = 0
                 pm_end = False
                 while not done:
                     s_tensor = torch.from_numpy(s).float().to(device)
-                    if pm_count >= np.sqrt(Simulator.number_of_machine) * np.sqrt(Simulator.number_of_job):
+                    if pm_count >= pm_limit:
                         pm_end = True
                     a = cls.q_pm.sample_action(s_tensor, epsilon, pm_end)
                     if a == 0:
@@ -240,26 +282,15 @@ class Two_Stage_MC_DQN:
                     cls.memory_pm.put((s, a, r, s_prime, done))
                     s = s_prime
                     score += r
-                    if done:
-                        if pm_end == True:
-                            print(f"Training Agent1 - Episode {n_epi} PM 초과 여부: {pm_end}, count: {pm_count}")
-                        break
+                if pm_end:
+                    print(f"Training Agent1 - Episode {n_epi} PM 초과 여부: {pm_end}, count: {pm_count}")
                 cls.memory_pm.end_episode()
 
             cls.first_mc_train(cls.q_pm, cls.memory_pm, cls.optimizer_pm, cls.loss_list_pm)
             cls.makespan_list_pm, cls.tardiness_list_pm, cls.score_list_pm = cls.script_performance(cls.env, n_epi, epsilon, cls.memory_pm, score, cls.makespan_list_pm, cls.tardiness_list_pm, cls.score_list_pm, pm_count)
-            cls.last_50_score_pm[n_epi] = (
-                np.nanmean(cls.score_list_pm[max(0, n_epi - 49):n_epi + 1])
-                if np.any(~np.isnan(cls.score_list_pm[max(0, n_epi - 49):n_epi + 1])) else np.nan
-            )
-            cls.last_50_makespan_pm[n_epi] = (
-                np.nanmean(cls.makespan_list_pm[max(0, n_epi - 49):n_epi + 1])
-                if np.any(~np.isnan(cls.makespan_list_pm[max(0, n_epi - 49):n_epi + 1])) else np.nan
-            )
-            cls.last_50_tardiness_pm[n_epi] = (
-                np.nanmean(cls.tardiness_list_pm[max(0, n_epi - 49):n_epi + 1])
-                if np.any(~np.isnan(cls.tardiness_list_pm[max(0, n_epi - 49):n_epi + 1])) else np.nan
-            )
+            cls.last_50_score_pm[n_epi] = cls.recent_mean(cls.score_list_pm, n_epi)
+            cls.last_50_makespan_pm[n_epi] = cls.recent_mean(cls.makespan_list_pm, n_epi)
+            cls.last_50_tardiness_pm[n_epi] = cls.recent_mean(cls.tardiness_list_pm, n_epi)
             if Parameters.param_down_on:
                 params = cls.q_pm.state_dict()
                 file_name = str(n_epi) + "pm_param.pt"
@@ -279,55 +310,26 @@ class Two_Stage_MC_DQN:
         cls.q_pm.to(device)
         cls.q_pm.eval()
 
+        def store_job_step(s, a_pm, a_job, r, s_prime, done):  # Agent2(rule 선택) step만 replay buffer에 저장
+            if a_job is not None:
+                cls.memory_job.put((s, a_job, r, s_prime, 1.0 if done else 0.0))
+
         score = 0.0
         pm_count = 0
         for n_epi in range(Hyperparameters.episode):
             epsilon = max(0, 1 - n_epi / (Hyperparameters.episode - 1))
+            Simulator.record_history = (n_epi == Hyperparameters.episode - 1)  # Gantt는 마지막 에피소드만 그림
             for dataid in Parameters.datasetId:
-                s = cls.env.reset(dataid)
-                done = False
-                score = 0.0
-                pm_count = 0
-                pm_end = False
-                while not done:
-                    with torch.no_grad(): # Agent 1은 고정된 상태
-                        s_tensor = torch.from_numpy(s).float().to(device)
-                        if pm_count >= np.sqrt(Simulator.number_of_machine) * np.sqrt(Simulator.number_of_job):
-                            pm_end = True
-                        a_pm = cls.q_pm.sample_action(s_tensor, 0, pm_end)
-                    if a_pm == 0:
-                        pm_count += 1
-                        s_pm, r_pm, done, _, _ = cls.env.two_step_select(a_pm, epsilon, 'first')
-                        s = s_pm
-                        score += r_pm
-                    else:
-                        s_tensor = torch.from_numpy(s).float().to(device)
-                        a_list = cls.q_job.sample_action_list(s_tensor)
-                        s_prime, r_job, done, a, _ = cls.env.two_step_select(a_list, epsilon, 'second')
-                        done_mask = 1.0 if done else 0.0
-                        cls.memory_job.put((s, a, r_job, s_prime, done_mask))
-                        s = s_prime
-                        score += r_job
-                    if done:
-                        if pm_end == True:
-                            print(f"Training Agent2 - Episode {n_epi} PM 초과 여부: {pm_end}, count: {pm_count}")
-                        break
+                score, pm_count, pm_end = cls.run_two_stage_episode(dataid, cls.q_pm, cls.q_job, epsilon, on_step=store_job_step)
+                if pm_end:
+                    print(f"Training Agent2 - Episode {n_epi} PM 초과 여부: {pm_end}, count: {pm_count}")
 
             if cls.memory_job.size() > Hyperparameters.buffer_limit / 10:
                 cls.second_train(cls.q_job, cls.q_job_target, cls.memory_job, cls.optimizer_job, cls.loss_list_job)
                 cls.makespan_list_job, cls.tardiness_list_job, cls.score_list_job = cls.script_performance(cls.env, n_epi, epsilon, cls.memory_job, score, cls.makespan_list_job, cls.tardiness_list_job, cls.score_list_job, pm_count)
-                cls.last_50_score_job[n_epi] = (
-                    np.nanmean(cls.score_list_job[max(0, n_epi - 49):n_epi + 1])
-                    if np.any(~np.isnan(cls.score_list_job[max(0, n_epi - 49):n_epi + 1])) else np.nan
-                )
-                cls.last_50_makespan_job[n_epi] = (
-                    np.nanmean(cls.makespan_list_job[max(0, n_epi - 49):n_epi + 1])
-                    if np.any(~np.isnan(cls.makespan_list_job[max(0, n_epi - 49):n_epi + 1])) else np.nan
-                )
-                cls.last_50_tardiness_job[n_epi] = (
-                    np.nanmean(cls.tardiness_list_job[max(0, n_epi - 49):n_epi + 1])
-                    if np.any(~np.isnan(cls.tardiness_list_job[max(0, n_epi - 49):n_epi + 1])) else np.nan
-                )
+                cls.last_50_score_job[n_epi] = cls.recent_mean(cls.score_list_job, n_epi)
+                cls.last_50_makespan_job[n_epi] = cls.recent_mean(cls.makespan_list_job, n_epi)
+                cls.last_50_tardiness_job[n_epi] = cls.recent_mean(cls.tardiness_list_job, n_epi)
                 if Parameters.param_down_on:
                     params = cls.q_job.state_dict()
                     file_name = str(n_epi) + "family_param.pt"
@@ -356,6 +358,7 @@ class Two_Stage_MC_DQN:
 
         evaluation_scores = {}  # checkpoint: score
         evaluation_makespans = {}
+        Simulator.record_history = False  # 평가 에피소드는 Gantt를 그리지 않음
         for check_point_number in check_point_list:
             check_point_path = os.path.join(save_directory_agent2, f"{check_point_number}family_param.pt")
             if not os.path.exists(check_point_path):
@@ -372,31 +375,9 @@ class Two_Stage_MC_DQN:
             pm_count = 0
             total_score = 0.0
             for dataset in Parameters.datasetId:
-                s = cls.env.reset(dataset)
-                done = False
-                score = 0.0
-                pm_end = False
-                while not done:
-                    with torch.no_grad():
-                        s_tensor = torch.from_numpy(s).float().to(device)
-                        if pm_count >= np.sqrt(Simulator.number_of_machine) * np.sqrt(Simulator.number_of_job):
-                            pm_end = True
-                        a_pm = q_pm.sample_action(s_tensor, 0, pm_end)
-                    if a_pm == 0:
-                        pm_count += 1
-                        s_pm, r_pm, done, _, _ = cls.env.two_step_select(a_pm, 0, 'first')
-                        s = s_pm
-                        score += r_pm
-                    else:
-                        s_tensor = torch.from_numpy(s).float().to(device)
-                        a_list = q_family.sample_action_list(s_tensor)
-                        s_prime, r_job, done, a, _ = cls.env.two_step_select(a_list, 0, 'second')
-                        s = s_prime
-                        score += r_job
-                    if done:
-                        if pm_end == True:
-                            print(f"Training Agent2 - Episode {check_point_number} PM 초과 여부: {pm_end}, count: {pm_count}")
-                        break
+                score, pm_count, pm_end = cls.run_two_stage_episode(dataset, q_pm, q_family, pm_count=pm_count)  # PM 횟수는 dataset 간 누적
+                if pm_end:
+                    print(f"Training Agent2 - Episode {check_point_number} PM 초과 여부: {pm_end}, count: {pm_count}")
 
                 total_score += score
                 total_score = np.round(total_score, decimals=3)
@@ -493,29 +474,9 @@ class Two_Stage_MC_DQN:
         q_family.eval()
 
         print(f"[Result] agent1: {best_checkpoint_pm}, agent2: {best_checkpoint_family} pt 최종 평가 시작")
+        Simulator.record_history = True
         for data_id in Parameters.datasetId:
-            s = cls.env.reset(data_id)
-            done = False
-            score = 0.0
-            pm_count = 0
-            pm_end = False
-            while not done:
-                with torch.no_grad():
-                    s_tensor = torch.from_numpy(s).float().to(device)
-                    if pm_count >= np.sqrt(Simulator.number_of_machine) * np.sqrt(Simulator.number_of_job):
-                        pm_end = True
-                    a_pm = q_pm.sample_action(s_tensor, 0, pm_end)
-                if a_pm == 0:
-                    pm_count += 1
-                    s_pm, r_pm, done, _, _ = cls.env.two_step_select(a_pm, 0, 'first')
-                    s = s_pm
-                    score += r_pm
-                else:
-                    s_tensor = torch.from_numpy(s).float().to(device)
-                    a_list = q_family.sample_action_list(s_tensor)
-                    s_prime, r_job, done, a, _ = cls.env.two_step_select(a_list, 0, 'second')
-                    s = s_prime
-                    score += r_job
+            score, pm_count, _ = cls.run_two_stage_episode(data_id, q_pm, q_family)
 
             Flow_time, util, makespan, tardiness, lateness, t_max = cls.env.performance_measure()
             elapsed_min = (time.time() - start_time) / 60
@@ -882,40 +843,15 @@ class Two_Stage_MC_DQN:
         q_pm.eval()
         q_job.eval()
 
+        def record_trace(s, a_pm, a_job, r, s_prime, done):
+            pm_states.append(np.array(s, copy=True))  # PMC trace: 모든 decision point
+            pm_actions.append(a_pm)
+            if a_job is not None:  # JA trace: rule 선택이 일어난 state만
+                ja_states.append(np.array(s, copy=True))
+                ja_actions.append(a_job)
+
         for data_id in dataset_ids:
-            s = cls.env.reset(data_id)
-            done = False
-            pm_count = 0
-            pm_end = False
-
-            while not done:
-                s_tensor = torch.from_numpy(s).float().to(device)
-
-                if pm_count >= np.sqrt(Simulator.number_of_machine) * np.sqrt(Simulator.number_of_job):
-                    pm_end = True
-
-                with torch.no_grad():
-                    a_pm = q_pm.sample_action(s_tensor, 0, pm_end)
-
-                # PMC trace 저장
-                pm_states.append(np.array(s, copy=True))
-                pm_actions.append(a_pm)
-
-                if a_pm == 0:  # PM 수행
-                    pm_count += 1
-                    s_prime, r_pm, done, _, _ = cls.env.two_step_select(a_pm, 0, 'first')
-                    s = s_prime
-                else:
-                    with torch.no_grad():
-                        a_list = q_job.sample_action_list(s_tensor)
-
-                    s_prime, r_job, done, a_job, _ = cls.env.two_step_select(a_list, 0, 'second')
-
-                    # JA trace 저장
-                    ja_states.append(np.array(s, copy=True))
-                    ja_actions.append(a_job)
-
-                    s = s_prime
+            cls.run_two_stage_episode(data_id, q_pm, q_job, on_step=record_trace)
 
         return {
             "pm_states": np.array(pm_states),
@@ -1338,29 +1274,7 @@ class Two_Stage_MC_DQN:
 
         for data_id in new_dataset_ids:
             print(f"[Inference] Dataset: {data_id}")
-
-            done = False
-            score = 0.0
-            pm_count = 0
-            pm_end = False
-
-            s = cls.env.reset(data_id)
-            while not done:
-                s_tensor = torch.from_numpy(s).float().to(device)
-                if (pm_count >= np.sqrt(Simulator.number_of_machine) * np.sqrt(Simulator.number_of_job)):
-                    pm_end = True
-                with torch.no_grad():
-                    a_pm = q_pm.sample_action(s_tensor, 0, pm_end)
-                if a_pm == 0:
-                    pm_count += 1
-                    s_prime, reward, done, _, _ = (cls.env.two_step_select(a_pm, 0, "first"))
-                else:
-                    with torch.no_grad():
-                        q_values = q_family.sample_action_list(s_tensor)
-                    s_prime, reward, done, action, _ = (cls.env.two_step_select(q_values, 0, "second"))
-
-                s = s_prime
-                score += reward
+            score, pm_count, _ = cls.run_two_stage_episode(data_id, q_pm, q_family)
 
             flow_time, util, makespan, tardiness, lateness, t_max = cls.env.performance_measure()
             print(f"[Result] Dataset   : {data_id}")
